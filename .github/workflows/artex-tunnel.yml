@@ -1,0 +1,43 @@
+name: artex-tunnel
+
+# Menjalankan ARTEX di GitHub Actions dan membukanya ke internet lewat
+# Cloudflare Quick Tunnel. Cara pakai: Actions tab -> artex-tunnel ->
+# Run workflow. URL publik + setup token muncul di log job.
+# Satu run tahan sampai 6 jam, lalu jalankan lagi bila perlu.
+# Repo ini HARUS privat: log berisi URL tunnel + setup token.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  tunnel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Clone ARTEX
+        run: git clone --depth 1 https://github.com/BaaRai/ARTEX artex
+
+      - name: Start ARTEX
+        working-directory: artex
+        run: |
+          PW=$(openssl rand -hex 16)
+          printf 'POSTGRES_USER=artex\nPOSTGRES_DB=artex\nPOSTGRES_PASSWORD=%s\n' "$PW" > .env
+          docker compose up -d --build
+          echo "Waiting for ARTEX (up to 5 min)..."
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8787/api/health > /dev/null; then
+              echo "ARTEX is up"
+              break
+            fi
+            sleep 10
+          done
+          echo "--- setup token (dibutuhkan di halaman /setup) ---"
+          docker compose logs artex | grep -i "Setup token for the /setup page" | tail -2 || true
+          curl -fsS http://127.0.0.1:8787/api/health
+
+      - name: Open public tunnel
+        run: |
+          curl -fsSL -o /tmp/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x /tmp/cloudflared
+          echo "Tunnel starting - URL publik muncul di bawah ini, biarkan run ini jalan"
+          /tmp/cloudflared tunnel --url http://127.0.0.1:8787
