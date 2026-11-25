@@ -1,10 +1,16 @@
 name: artex-tunnel
 
-# Menjalankan ARTEX di GitHub Actions dan membukanya ke internet lewat
-# Cloudflare Quick Tunnel. Cara pakai: Actions tab -> artex-tunnel ->
-# Run workflow. URL publik + setup token muncul di log job.
+# ARTEX di GitHub Actions + Cloudflare Quick Tunnel.
+# AMAN UNTUK REPO PUBLIC: URL tunnel + setup token TIDAK PERNAH
+# dicetak di log. Keduanya hanya dikirim ke Telegram via Secrets.
+# Cara pakai: Actions tab -> artex-tunnel -> Run workflow.
+# Tunggu pesan Telegram, buka URL dari pesan itu, masukkan token.
 # Satu run tahan sampai 6 jam, lalu jalankan lagi bila perlu.
-# Repo ini HARUS privat: log berisi URL tunnel + setup token.
+#
+# Secrets yang wajib diisi dulu (repo Settings > Secrets and variables
+# > Actions > New repository secret):
+#   TELEGRAM_BOT_TOKEN - token dari @BotFather
+#   TELEGRAM_CHAT_ID   - chat id kamu (dari @userinfobot / getUpdates)
 
 on:
   workflow_dispatch:
@@ -26,6 +32,7 @@ jobs:
       - name: Start ARTEX
         working-directory: artex
         run: |
+          set -euo pipefail
           PW=$(openssl rand -hex 16)
           printf 'POSTGRES_USER=artex\nPOSTGRES_DB=artex\nPOSTGRES_PASSWORD=%s\n' "$PW" > .env
           docker compose up -d --build
@@ -37,13 +44,55 @@ jobs:
             fi
             sleep 10
           done
-          echo "--- setup token (dibutuhkan di halaman /setup) ---"
-          docker compose logs artex | grep -i "Setup token for the /setup page" | tail -2 || true
           curl -fsS http://127.0.0.1:8787/api/health
+          # Ambil setup token dari log container, JANGAN dicetak.
+          TOKEN=$(docker compose logs artex 2>/dev/null | grep -i "Setup token for the /setup page" | tail -1 | grep -oE '[0-9a-f]{32,64}' | tail -1 || true)
+          if [ -z "$TOKEN" ]; then
+            echo "::error::Setup token tidak ditemukan di log ARTEX"
+            exit 1
+          fi
+          echo "::add-mask::$TOKEN"
+          printf '%s' "$TOKEN" > /tmp/artex-token.txt
+          chmod 600 /tmp/artex-token.txt
+          echo "Setup token captured (hidden from log)"
 
-      - name: Open public tunnel
+      - name: Open tunnel and notify via Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
+          set -euo pipefail
+          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+            echo "::error::Isi dulu Secrets TELEGRAM_BOT_TOKEN dan TELEGRAM_CHAT_ID di repo Settings > Secrets and variables > Actions"
+            exit 1
+          fi
           curl -fsSL -o /tmp/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x /tmp/cloudflared
-          echo "Tunnel starting - URL publik muncul di bawah ini, biarkan run ini jalan"
-          /tmp/cloudflared tunnel --url http://127.0.0.1:8787
+          # Jalan di background, output HANYA ke file (tidak ke log job).
+          /tmp/cloudflared tunnel --url http://127.0.0.1:8787 > /tmp/cf.log 2>&1 &
+          CF_PID=$!
+          echo "Waiting for tunnel URL (up to 5 min)..."
+          URL=""
+          for i in $(seq 1 30); do
+            URL=$(grep -oE 'https://[A-Za-z0-9.-]+\.trycloudflare\.com' /tmp/cf.log 2>/dev/null | head -1 || true)
+            if [ -n "$URL" ]; then
+              break
+            fi
+            sleep 10
+          done
+          if [ -z "$URL" ]; then
+            echo "::error::Tunnel URL tidak muncul"
+            exit 1
+          fi
+          echo "::add-mask::$URL"
+          TOKEN=$(cat /tmp/artex-token.txt)
+          MESSAGE=$(printf 'ARTEX siap!\n\nURL: %s\nSetup token: %s\n\nBuka URL, masukkan token di /setup, lalu buat password admin. Link + token ini hanya berlaku selama run ini jalan (maks 6 jam).' "$URL" "$TOKEN")
+          RESP=$(curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${MESSAGE}")
+          case "$RESP" in
+            *'"ok":true'*) echo "Telegram sent, tunnel running - job stays alive up to 6h" ;;
+            *) echo "::error::Gagal kirim Telegram (cek bot token / chat id)"; exit 1 ;;
+          esac
+          # Jaga run tetap hidup selama tunnel jalan.
+          wait "$CF_PID"
