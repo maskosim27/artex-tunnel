@@ -37,7 +37,6 @@ jobs:
       - name: Configure PentAGI, create protected gateway and start Cloudflare Quick Tunnel
         shell: bash
         env:
-          # Add at least ONE LLM provider secret in repository Settings > Secrets and variables > Actions.
           OPEN_AI_KEY: ${{ secrets.OPEN_AI_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -51,7 +50,6 @@ jobs:
           LLM_SERVER_URL: ${{ secrets.LLM_SERVER_URL }}
           LLM_SERVER_KEY: ${{ secrets.LLM_SERVER_KEY }}
           LLM_SERVER_MODEL: ${{ secrets.LLM_SERVER_MODEL }}
-          # Optional web-search provider secrets. DuckDuckGo + Sploitus are enabled without keys.
           TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
           FIRECRAWL_API_KEY: ${{ secrets.FIRECRAWL_API_KEY }}
           PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
@@ -63,6 +61,7 @@ jobs:
         run: |
           set -euo pipefail
 
+          # ---------- 1. Validasi secret ----------
           if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]]; then
             echo "::error::Isi GitHub Secrets TELEGRAM_BOT_TOKEN dan TELEGRAM_CHAT_ID terlebih dahulu."
             exit 1
@@ -74,23 +73,120 @@ jobs:
             CUSTOM_LLM_READY=1
           fi
           if [[ -z "$BUILTIN_LLM_KEYS" && "$CUSTOM_LLM_READY" != "1" ]]; then
-            echo "::error::PentAGI memerlukan minimal satu provider LLM. Isi salah satu secret provider (mis. GLM_API_KEY, OPEN_AI_KEY, ANTHROPIC_API_KEY), atau lengkapi LLM_SERVER_URL + LLM_SERVER_KEY + LLM_SERVER_MODEL."
+            echo "::error::PentAGI memerlukan minimal satu provider LLM (mis. GLM_API_KEY, OPEN_AI_KEY, ANTHROPIC_API_KEY) atau LLM_SERVER_URL+KEY+MODEL."
             exit 1
           fi
 
-          # Create the one-time Cloudflare URL before starting PentAGI so PUBLIC_URL and CORS
-          # can be set correctly on the first boot. The origin will become available after setup.
+          cd pentagi
+
+          # ---------- 2. Generate basic-auth gateway ----------
+          BASIC_USER="pentagi"
+          BASIC_PASS="$(openssl rand -hex 16)"
+          echo "GATEWAY_USER=$BASIC_USER" >> "$GITHUB_ENV"
+          echo "GATEWAY_PASS=$BASIC_PASS" >> "$GITHUB_ENV"
+
+          # ---------- 3. Start cloudflared dulu, ambil URL ----------
           curl -fsSL -o /tmp/cloudflared \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x /tmp/cloudflared
-          /tmp/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:18080 > /tmp/cloudflared.log 2>&1 &
+          /tmp/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:18080 \
+            > /tmp/cloudflared.log 2>&1 &
           CF_PID=$!
 
           echo "Waiting for Cloudflare Quick Tunnel URL..."
           TUNNEL_URL=""
           for i in $(seq 1 60); do
-            TUNNEL_URL=$(grep -Eo 'https://[A-Za-z0-9.-]+\.trycloudflare\.com' /tmp/cloudflared.log 2>/dev/null | head -n 1 || true)
+            TUNNEL_URL="$(grep -Eo 'https://[A-Za-z0-9.-]+\.trycloudflare\.com' /tmp/cloudflared.log 2>/dev/null | head -n 1 || true)"
             [[ -n "$TUNNEL_URL" ]] && break
             kill -0 "$CF_PID" 2>/dev/null || {
               echo "::error::cloudflared berhenti sebelum URL tunnel tersedia."
               tail -n 30 /tmp/cloudflared.log || true
+              exit 1
+            }
+            sleep 1
+          done
+          if [[ -z "$TUNNEL_URL" ]]; then
+            echo "::error::Gagal mendapatkan URL Cloudflare Quick Tunnel."
+            tail -n 30 /tmp/cloudflared.log || true
+            exit 1
+          fi
+          echo "Tunnel URL: $TUNNEL_URL"
+
+          # ---------- 4. Reverse proxy + basic auth di :18080 ----------
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq nginx apache2-utils
+          echo "${BASIC_USER}:$(openssl passwd -apr1 "$BASIC_PASS")" | sudo tee /etc/nginx/.htpasswd > /dev/null
+
+          sudo tee /etc/nginx/sites-available/pentagi > /dev/null <<'NGINX'
+          server {
+            listen 18080;
+            server_name _;
+            client_max_body_size 100m;
+
+            location / {
+              auth_basic "PentAGI";
+              auth_basic_user_file /etc/nginx/.htpasswd;
+
+              proxy_pass https://127.0.0.1:8443;
+              proxy_ssl_verify off;
+
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+              proxy_http_version 1.1;
+              proxy_set_header Upgrade $http_upgrade;
+              proxy_set_header Connection "upgrade";
+              proxy_read_timeout 3600s;
+              proxy_send_timeout 3600s;
+            }
+          }
+          NGINX
+          sudo ln -sf /etc/nginx/sites-available/pentagi /etc/nginx/sites-enabled/pentagi
+          sudo rm -f /etc/nginx/sites-enabled/default
+          sudo nginx -t
+          sudo systemctl restart nginx
+
+          # ---------- 5. Start PentAGI ----------
+          docker compose up -d
+          echo "Menunggu PentAGI siap di :8443 ..."
+          READY=0
+          for i in $(seq 1 180); do
+            if curl -kfsS -o /dev/null "https://127.0.0.1:8443/" 2>/dev/null; then
+              READY=1
+              break
+            fi
+            sleep 2
+          done
+          if [[ "$READY" != "1" ]]; then
+            echo "::warning::PentAGI belum merespons di :8443 setelah 6 menit. Cek log container."
+            docker compose ps || true
+            docker compose logs --tail=80 || true
+          else
+            echo "PentAGI OK."
+          fi
+
+          # ---------- 6. Notifikasi Telegram ----------
+          MSG="<b>PentAGI Tunnel Ready</b>%0AURL: ${TUNNEL_URL}%0AUser: ${BASIC_USER}%0APass: ${BASIC_PASS}%0AJam: $(date -u +%H:%M:%SZ)"
+          curl -fsS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            -d parse_mode=HTML \
+            --data-urlencode "text=${MSG//%/\\%}" > /dev/null || \
+            echo "::warning::Gagal kirim notifikasi Telegram."
+
+          echo "::notice::Tunnel aktif: $TUNNEL_URL (user: $BASIC_USER)"
+
+          # ---------- 7. Keepalive sampai job timeout ----------
+          echo "Menjaga tunnel tetap hidup hingga job timeout..."
+          while true; do
+            sleep 30
+            if ! kill -0 "$CF_PID" 2>/dev/null; then
+              echo "::warning::cloudflared mati, restart..."
+              /tmp/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:18080 \
+                >> /tmp/cloudflared.log 2>&1 &
+              CF_PID=$!
+            fi
+            if ! curl -fsS -o /dev/null "http://127.0.0.1:18080/" 2>/dev/null; then
+              echo "::warning::Gateway :18080 tidak merespons."
+            fi
+          done
