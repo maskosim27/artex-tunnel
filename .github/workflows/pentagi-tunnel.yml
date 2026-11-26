@@ -1,0 +1,248 @@
+name: pentagi-tunnel
+
+on:
+  workflow_dispatch:
+
+jobs:
+  tunnel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Free disk space
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/share/swift \
+            /opt/ghc \
+            /usr/local/share/boost \
+            /usr/local/lib/android \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/powershell || true
+          sudo docker system prune -af --volumes || true
+          sudo apt-get clean || true
+          df -h
+
+      - name: Clone PentAGI
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/vxcontrol/pentagi.git pentagi
+          cd pentagi
+          cp .env.example .env
+          touch example.custom.provider.yml example.ollama.provider.yml example.bedrock.provider.yml
+
+      - name: Configure PentAGI, create protected gateway and start Cloudflare Quick Tunnel
+        shell: bash
+        env:
+          # Add at least ONE LLM provider secret in repository Settings > Secrets and variables > Actions.
+          OPEN_AI_KEY: ${{ secrets.OPEN_AI_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
+          KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
+          QWEN_API_KEY: ${{ secrets.QWEN_API_KEY }}
+          MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+          LLM_SERVER_URL: ${{ secrets.LLM_SERVER_URL }}
+          LLM_SERVER_KEY: ${{ secrets.LLM_SERVER_KEY }}
+          LLM_SERVER_MODEL: ${{ secrets.LLM_SERVER_MODEL }}
+          # Optional web-search provider secrets. DuckDuckGo + Sploitus are enabled without keys.
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          FIRECRAWL_API_KEY: ${{ secrets.FIRECRAWL_API_KEY }}
+          PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          GOOGLE_CX_KEY: ${{ secrets.GOOGLE_CX_KEY }}
+          TRAVERSAAL_API_KEY: ${{ secrets.TRAVERSAAL_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]]; then
+            echo "::error::Isi GitHub Secrets TELEGRAM_BOT_TOKEN dan TELEGRAM_CHAT_ID terlebih dahulu."
+            exit 1
+          fi
+
+          BUILTIN_LLM_KEYS="${OPEN_AI_KEY:-}${ANTHROPIC_API_KEY:-}${GEMINI_API_KEY:-}${DEEPSEEK_API_KEY:-}${GLM_API_KEY:-}${KIMI_API_KEY:-}${QWEN_API_KEY:-}${MINIMAX_API_KEY:-}${MISTRAL_API_KEY:-}${XAI_API_KEY:-}"
+          CUSTOM_LLM_READY=0
+          if [[ -n "${LLM_SERVER_URL:-}" && -n "${LLM_SERVER_KEY:-}" && -n "${LLM_SERVER_MODEL:-}" ]]; then
+            CUSTOM_LLM_READY=1
+          fi
+          if [[ -z "$BUILTIN_LLM_KEYS" && "$CUSTOM_LLM_READY" != "1" ]]; then
+            echo "::error::PentAGI memerlukan minimal satu provider LLM. Isi salah satu secret provider (mis. GLM_API_KEY, OPEN_AI_KEY, ANTHROPIC_API_KEY), atau lengkapi LLM_SERVER_URL + LLM_SERVER_KEY + LLM_SERVER_MODEL."
+            exit 1
+          fi
+
+          # Create the one-time Cloudflare URL before starting PentAGI so PUBLIC_URL and CORS
+          # can be set correctly on the first boot. The origin will become available after setup.
+          curl -fsSL -o /tmp/cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x /tmp/cloudflared
+          /tmp/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:18080 > /tmp/cloudflared.log 2>&1 &
+          CF_PID=$!
+
+          echo "Waiting for Cloudflare Quick Tunnel URL..."
+          TUNNEL_URL=""
+          for i in $(seq 1 60); do
+            TUNNEL_URL=$(grep -Eo 'https://[A-Za-z0-9.-]+\.trycloudflare\.com' /tmp/cloudflared.log 2>/dev/null | head -n 1 || true)
+            [[ -n "$TUNNEL_URL" ]] && break
+            if ! kill -0 "$CF_PID" 2>/dev/null; then
+              echo "::error::cloudflared berhenti sebelum URL tunnel tersedia."
+              tail -n 30 /tmp/cloudflared.log || true
+              exit 1
+            fi
+            sleep 5
+          done
+
+          if [[ -z "$TUNNEL_URL" ]]; then
+            echo "::error::URL Cloudflare Quick Tunnel tidak muncul."
+            tail -n 30 /tmp/cloudflared.log || true
+            exit 1
+          fi
+          echo "::add-mask::$TUNNEL_URL"
+
+          # Generate private gateway credentials and mask them from Actions logs.
+          BASIC_USER="pentagi"
+          BASIC_PASS=$(openssl rand -hex 18)
+          DB_PASS=$(openssl rand -hex 24)
+          COOKIE_SALT=$(openssl rand -hex 32)
+          echo "::add-mask::$BASIC_PASS"
+          echo "::add-mask::$DB_PASS"
+          echo "::add-mask::$COOKIE_SALT"
+
+          # Configure official PentAGI .env. Do not print this file: it contains API keys.
+          cd pentagi
+          export PUBLIC_URL="$TUNNEL_URL"
+          export COOKIE_SIGNING_SALT="$COOKIE_SALT"
+          export PENTAGI_POSTGRES_PASSWORD="$DB_PASS"
+          export PENTAGI_LISTEN_IP="127.0.0.1"
+          export PENTAGI_LISTEN_PORT="8443"
+          export CORS_ORIGINS="$TUNNEL_URL"
+          export DOCKER_INSIDE="false"
+          export DOCKER_SOCKET=""
+          export DOCKER_PORTS_BASE="28000"
+          export DOCKER_PUBLIC_IP="127.0.0.1"
+          export DUCKDUCKGO_ENABLED="true"
+          export SPLOITUS_ENABLED="true"
+
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          path = Path('.env')
+          lines = path.read_text().splitlines()
+          keys = [
+              'PUBLIC_URL', 'COOKIE_SIGNING_SALT', 'PENTAGI_POSTGRES_PASSWORD',
+              'PENTAGI_LISTEN_IP', 'PENTAGI_LISTEN_PORT', 'CORS_ORIGINS',
+              'DOCKER_INSIDE', 'DOCKER_SOCKET', 'DOCKER_PORTS_BASE',
+              'DOCKER_PUBLIC_IP', 'DUCKDUCKGO_ENABLED', 'SPLOITUS_ENABLED',
+              'OPEN_AI_KEY', 'ANTHROPIC_API_KEY', 'GEMINI_API_KEY',
+              'DEEPSEEK_API_KEY', 'GLM_API_KEY', 'KIMI_API_KEY', 'QWEN_API_KEY',
+              'MINIMAX_API_KEY', 'MISTRAL_API_KEY', 'XAI_API_KEY',
+              'LLM_SERVER_URL', 'LLM_SERVER_KEY', 'LLM_SERVER_MODEL',
+              'TAVILY_API_KEY', 'FIRECRAWL_API_KEY', 'PERPLEXITY_API_KEY',
+              'GOOGLE_API_KEY', 'GOOGLE_CX_KEY', 'TRAVERSAAL_API_KEY',
+          ]
+          updates = {key: os.environ.get(key, '') for key in keys}
+          found = set()
+          output = []
+          for line in lines:
+              if '=' in line and not line.lstrip().startswith('#'):
+                  key = line.split('=', 1)[0].strip()
+                  if key in updates:
+                      output.append(f'{key}={updates[key]}')
+                      found.add(key)
+                      continue
+              output.append(line)
+          for key, value in updates.items():
+              if key not in found:
+                  output.append(f'{key}={value}')
+          path.write_text('\n'.join(output) + '\n')
+          path.chmod(0o600)
+          PY
+
+          # Keep the agent callback range loopback-only on this ephemeral runner.
+          # This protects the runner, but out-of-band callbacks from external targets won't reach it.
+
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq nginx apache2-utils
+          printf '%s\n' "$BASIC_PASS" | sudo htpasswd -ci /etc/nginx/pentagi.htpasswd "$BASIC_USER"
+          sudo chmod 640 /etc/nginx/pentagi.htpasswd
+
+          sudo tee /etc/nginx/conf.d/pentagi-gateway.conf > /dev/null <<'NGINX'
+          map $http_upgrade $pentagi_connection_upgrade {
+              default upgrade;
+              ''      close;
+          }
+
+          server {
+              listen 127.0.0.1:18080;
+              server_name _;
+              client_max_body_size 100m;
+
+              location / {
+                  auth_basic "Private PentAGI";
+                  auth_basic_user_file /etc/nginx/pentagi.htpasswd;
+
+                  proxy_pass https://127.0.0.1:8443;
+                  proxy_ssl_verify off;
+                  proxy_ssl_server_name on;
+                  proxy_http_version 1.1;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Forwarded-Host $host;
+                  proxy_set_header X-Forwarded-Proto https;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection $pentagi_connection_upgrade;
+                  proxy_read_timeout 3600s;
+                  proxy_send_timeout 3600s;
+                  proxy_buffering off;
+              }
+          }
+          NGINX
+          sudo nginx -t
+          sudo systemctl restart nginx
+
+          echo "Starting PentAGI official Docker Compose stack..."
+          docker compose pull
+          docker compose up -d
+
+          echo "Waiting for PentAGI HTTPS UI..."
+          READY=0
+          for i in $(seq 1 90); do
+            CODE=$(curl -k -sS -o /dev/null -w '%{http_code}' --max-time 10 https://127.0.0.1:8443/ || true)
+            if [[ "$CODE" =~ ^(200|301|302|303|307|308)$ ]]; then
+              READY=1
+              break
+            fi
+            sleep 10
+          done
+
+          if [[ "$READY" != "1" ]]; then
+            echo "::error::PentAGI belum siap. Ringkasan container:"
+            docker compose ps || true
+            docker compose logs --tail=100 pentagi pgvector scraper || true
+            exit 1
+          fi
+
+          echo "Checking protected gateway..."
+          curl -fsS --max-time 20 -u "$BASIC_USER:$BASIC_PASS" \
+            http://127.0.0.1:18080/ -o /dev/null
+
+          MESSAGE=$(printf 'PENTAGI SIAP!\n\nURL: %s\n\nGateway Basic Auth:\nUsername: %s\nPassword: %s\n\nPentAGI application login (default):\nEmail: admin@pentagi.com\nPassword: admin\n\nPENTING: Setelah login pertama, segera ganti password admin di Settings > Account. Jangan bagikan URL dan kredensial gateway.\n\nProvider LLM sudah dikonfigurasi dari GitHub Secrets. DuckDuckGo dan Sploitus aktif. Runner/tunnel berlaku selama workflow berjalan (maksimal 6 jam).' "$TUNNEL_URL" "$BASIC_USER" "$BASIC_PASS")
+
+          RESP=$(curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${MESSAGE}")
+          case "$RESP" in
+            *'"ok":true'*) echo "Telegram notification sent. PentAGI is running." ;;
+            *) echo "::error::Gagal mengirim notifikasi Telegram. Periksa TELEGRAM_BOT_TOKEN dan TELEGRAM_CHAT_ID."; exit 1 ;;
+          esac
+
+          echo "Keeping Cloudflare Quick Tunnel alive..."
+          wait "$CF_PID"
