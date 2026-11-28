@@ -1,0 +1,116 @@
+name: Strix Web Viewer with Cloudflared Tunnel
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Target scan (default: direktori repo ini ".")'
+        required: true
+        default: '.'
+      keep_alive_minutes:
+        description: 'Durasi tunnel tetap aktif (menit, maks 300)'
+        required: true
+        default: '60'
+
+jobs:
+  run-strix-tunnel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Strix & Cloudflared
+        run: |
+          pip install --quiet strix-agent
+          curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o cloudflared.deb
+          sudo dpkg -i cloudflared.deb > /dev/null
+          rm -f cloudflared.deb
+
+      - name: Jalankan Strix, Tunneling & Kirim ke Telegram (Silent Log)
+        env:
+          env:
+          STRIX_LLM: ${{ secrets.STRIX_LLM }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_API_BASE: ${{ secrets.LLM_API_BASE }}
+          OPENAI_API_KEY: ${{ secrets.LLM_API_KEY }}
+          OPENAI_API_BASE: ${{ secrets.LLM_API_BASE }}
+          OPENAI_BASE_URL: ${{ secrets.LLM_API_BASE }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TARGET: ${{ github.event.inputs.target }}
+          KEEP_ALIVE: ${{ github.event.inputs.keep_alive_minutes }}
+        run: |
+          set +x
+          mkdir -p strix_runs
+
+          echo "Memulai Strix scan di background..."
+          strix --target "$TARGET" > /tmp/strix_scan.log 2>&1 &
+          STRIX_PID=$!
+
+          echo "Memulai Strix Web Viewer di port 8080..."
+          strix view --host 127.0.0.1 --port 8080 --no-open > /tmp/strix_view.log 2>&1 &
+
+          echo "Memulai Cloudflare Tunnel..."
+          cloudflared tunnel --url http://127.0.0.1:8080 --no-autoupdate > /tmp/cf.log 2>&1 &
+
+          # Tunggu URL Cloudflared muncul (maks 30 detik)
+          CF_URL=""
+          for i in $(seq 1 30); do
+            CF_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/cf.log | head -n 1 || true)
+            if [ -n "$CF_URL" ]; then
+              break
+            fi
+            sleep 1
+          done
+
+          if [ -z "$CF_URL" ]; then
+            echo "Gagal mendapatkan URL Cloudflared."
+            exit 1
+          fi
+
+          # Ambil token akses dari output strix view (jika ada)
+          STRIX_TOKEN=""
+          for i in $(seq 1 15); do
+            STRIX_TOKEN=$(grep -oE 'token=[a-zA-Z0-9._-]+' /tmp/strix_view.log | head -n 1 | cut -d'=' -f2 || true)
+            if [ -n "$STRIX_TOKEN" ]; then
+              break
+            fi
+            sleep 1
+          done
+
+          # Masking semua nilai sensitif agar tidak pernah tercetak di log GitHub Actions
+          echo "::add-mask::$CF_URL"
+          if [ -n "$STRIX_TOKEN" ]; then
+            echo "::add-mask::$STRIX_TOKEN"
+            FINAL_URL="${CF_URL}/?token=${STRIX_TOKEN}"
+          else
+            FINAL_URL="${CF_URL}"
+          fi
+          echo "::add-mask::$FINAL_URL"
+
+          # Hapus file log mentah agar tidak terbaca secara tidak sengaja
+          rm -f /tmp/cf.log /tmp/strix_view.log
+
+          # Kirim ke Telegram (redirect output curl ke /dev/null agar respons JSON Telegram tidak bocor ke log)
+          MESSAGE=$(printf "Strix Dashboard Aktif\n\nTarget: %s\nLink Akses: %s\nDurasi Maks: %s menit" "$TARGET" "$FINAL_URL" "$KEEP_ALIVE")
+
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${MESSAGE}")
+
+          if [ "$HTTP_CODE" -eq 200 ]; then
+            echo "Link akses berhasil dikirim ke Telegram secara tersembunyi."
+          else
+            echo "Gagal mengirim pesan ke Telegram (HTTP Status: $HTTP_CODE)."
+            exit 1
+          fi
+
+          echo "Tunnel aktif. Menunggu durasi selesai (${KEEP_ALIVE} menit)..."
+          sleep "$((KEEP_ALIVE * 60))"
